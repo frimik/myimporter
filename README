@@ -1,0 +1,74 @@
+NAME
+    myimporter - Import dump files produced by mydumper
+    (<https://launchpad.net/mydumper>).
+
+SYNOPSIS
+    myimporter [options] [file.sql file2.sql.gz ...]
+
+OPTIONS
+    --host  Host to connect to.
+
+    --port  Port, default: 3306
+
+    --user  Database user.
+
+    --pass  Database Password.
+
+    --database
+            Database (Schema) to import into. (Must exist).
+
+    --socket
+            Specifies a local socket. Alternative to Host and Port.
+
+    --threads
+            Number of threads to use. Defaults to number of processors found
+            in /proc/cpuinfo.
+
+    --filter
+            Filename with tables to filter from the import. One table name
+            per line.
+
+DESCRIPTION
+    myimporter will import all files given as arguments in the order given.
+
+    Recommendation is to list the biggest (or slowest to import) tables
+    first.
+
+EXAMPLE
+    Backing up database: *test*
+        mydumper --host db-server.example.com --user backup-user --password
+        pass --database test --threads 6 --outputdir /tmp/dump.test
+        --compress
+
+        mysqldump -v --no-data --routines --host=db-server2
+        --user=backup-user --password=pass test >
+        /tmp/dump.test/.structure.sql
+
+    Importing previously backed up database *test*
+        mysql test < /tmp/dump.test/.structure.sql
+
+        ls -1hS /tmp/dump.test/*.sql.gz | xargs myimporter --threads 8
+        --database test --user root --socket /mysql/main/run/mysql.sock
+
+        ls -1hS /tmp/dump.test/*.sql.gz | xargs myimporter --threads 8
+        --database test --user root --socket /tmp/mysql.sock --filter
+        /tmp/filter.txt
+
+DEPENDENCIES
+    threads
+    threads::shared
+    Thread::Queue
+    Time::HiRes
+    Time::Duration
+    Getopt::Long
+    Pod::Usage
+
+TOOD
+    Restore is limited to one specific database.
+
+AUTHOR
+    Mikael Fridh
+
+ACKNOWLEDGEMENTS
+    Domas Mituzas obviously.
+

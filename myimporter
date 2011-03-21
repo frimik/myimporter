@@ -1,0 +1,277 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+
+use threads;
+use threads::shared;
+use Thread::Queue;
+use Time::HiRes qw(usleep gettimeofday tv_interval);
+use Time::Duration;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+
+our ($host, $port, $database, $user, $password, $threads, $socket, $help, 
+$noop);
+
+my $filterfile;
+
+# defaults
+$port = 3306;
+$socket = "/tmp/mysql.sock";
+$password = "";
+$database = "";
+$noop = 0;
+$threads = `grep -c "^processor" /proc/cpuinfo`;
+$filterfile = undef;
+my @suffixes = (".sql", ".sql.gz");
+
+GetOptions (
+    "host|h=s"          => \$host, #database host
+    "port|P=i"          => \$port, #database port
+    "user|u=s"          => \$user, #database user
+    "database|db|d=s"   => \$database, #schema
+    "password|p=s"      => \$password, #database password
+    "socket|S=s"        => \$socket, 
+    "filter|f=s"        => \$filterfile,
+    "threads|t=i"       => \$threads, #number of threads
+    "help"              => \$help,
+    "noop"              => \$noop,
+) or die("Error parsing options");
+
+pod2usage(-verbose=>2) if $help;
+pod2usage(-verbose=>1) unless $database;
+pod2usage(-verbose=>1) unless (($host and $port) || $socket);
+pod2usage(-verbose=>1) unless $user;
+
+$host = "localhost" unless ($host);
+
+print "Host: $host\nPort: $port\nSocket: $socket\nThreads: $threads\n";
+
+my @filter;
+
+if (defined($filterfile)) {
+    if (-f $filterfile) {
+        open(FILE, "$filterfile") or die("Error opening $filterfile: $!");
+        @filter = <FILE>;
+        chomp(@filter);
+    } else {
+        die("No such file or directory: $filterfile");
+    }
+}
+
+my $counter = 0;
+share $counter;
+$| = 1;
+
+my $q = Thread::Queue->new();
+
+my $t0 = [gettimeofday]; # Import start time.
+
+foreach my $arg (@ARGV) {
+    if ($filterfile) {
+        if (is_filtered(\@filter, $arg)) {
+            print "INFO: $arg matches filter list, skipping ...\n";
+            next;
+        } else {
+            $q->enqueue($arg);
+        }
+    } else {
+        $q->enqueue($arg);
+    }
+}
+
+for (my $i = 0; $i <= $threads - 1; $i++) {
+    my $thr = threads->create(\&worker);
+    $counter++;
+}
+
+{ lock($counter); cond_wait($counter) until $counter == 0; }
+
+print get_timestring() . " - All threads done! Cleaning up.\n";
+
+my $t1 = [gettimeofday]; # Import end time.
+
+my $elapsed = tv_interval($t0, $t1);
+
+print "Run time ", duration($elapsed), ".\n";
+
+# join old threads when finished
+my @threads = threads->list();
+foreach my $thr (@threads) {
+    $thr->join();
+}
+
+exit(0);
+
+sub get_timestring {
+    my $t_string = localtime();
+    return $t_string;
+}
+
+sub worker {
+    print(get_timestring() . " - T" . threads->tid() . " started.\n");
+    while ($q->pending()) {
+        my $gz = 0;
+        if (defined(my $item = $q->dequeue_nb())) {
+            print(get_timestring() . " - T" . threads->tid() . ": Processing $item ...\n");
+            if ( $item =~ m/.*\.gz$/ ) {
+                $gz = 1;
+            }
+            my $arg = 
+                ($gz ? "gunzip -c $item" : "cat $item") . 
+                "|mysql --user=$user" .
+                ($password ? " --password=$password" : "") .
+                ($host ? " --host=$host" : "") .
+                ($socket ? " --socket=$socket" : "") .
+                ($database ? " --database=$database" : "");
+            if ($noop) {
+                { 
+                    lock ($counter);
+                    print("$arg\n");
+                }
+            } else {
+                my $t0 = [gettimeofday];
+                system($arg);
+                my $t1 = [gettimeofday];
+                my $elapsed = tv_interval $t0, $t1;
+                {
+                    lock ($counter);
+                    print("TIMING: $item\t$elapsed\t (". duration($elapsed) .")\n");
+                }
+            }
+        } else {
+            usleep(100);
+        }
+    }
+
+    { lock ($counter); $counter--; cond_signal($counter); }
+    print(get_timestring() . " - T" . threads->tid() . " exited, $counter threads still running.\n");
+}
+
+sub is_filtered {
+    my ($filter, $filename) = @_;
+    my ($tablename, undef, undef) = fileparse($filename, @suffixes);
+    $tablename =~ s/^[^\.]*?\.(.*)/$1/;
+    my $filtered = grep(/$tablename/, @$filter);
+    return ($filtered);
+}
+
+__END__
+
+=head1 NAME
+
+myimporter - Import dump files produced by B<mydumper> 
+(L<https://launchpad.net/mydumper>).
+
+=head1 SYNOPSIS
+
+myimporter [options] [file.sql file2.sql.gz ...]
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--host>
+
+Host to connect to.
+
+=item B<--port>
+
+Port, default: 3306
+
+=item B<--user>
+
+Database user.
+
+=item B<--pass>
+
+Database Password.
+
+=item B<--database>
+
+Database (Schema) to import into. (Must exist).
+
+=item B<--socket>
+
+Specifies a local socket. Alternative to B<Host> and B<Port>.
+
+=item B<--threads>
+
+Number of threads to use. Defaults to number of processors found in
+/proc/cpuinfo.
+
+=item B<--filter>
+
+Filename with tables to filter from the import. One table name per line.
+
+=back
+
+=head1 DESCRIPTION
+
+B<myimporter> will import all files given as arguments in the order given.
+
+Recommendation is to list the biggest (or slowest to import) tables first.
+
+=head1 EXAMPLE
+
+=over 4
+
+=item B<Backing up database: I<test>>
+
+mydumper --host db-server.example.com --user backup-user --password pass 
+    --database test --threads 6 --outputdir /tmp/dump.test --compress
+
+mysqldump -v --no-data --routines --host=db-server2
+    --user=backup-user --password=pass test > /tmp/dump.test/.structure.sql
+
+=item B<Importing previously backed up database I<test>>
+
+mysql test E<lt> /tmp/dump.test/.structure.sql
+
+ls -1hS /tmp/dump.test/*.sql.gz | xargs myimporter --threads 8 --database test 
+    --user root --socket /mysql/main/run/mysql.sock
+
+ls -1hS /tmp/dump.test/*.sql.gz | xargs myimporter --threads 8 --database test
+    --user root --socket /tmp/mysql.sock --filter /tmp/filter.txt
+
+=back
+
+=head1 DEPENDENCIES
+
+=over 8
+
+=item B<threads>
+
+=item B<threads::shared>
+
+=item B<Thread::Queue>
+
+=item B<Time::HiRes>
+
+=item B<Time::Duration>
+
+=item B<Getopt::Long>
+
+=item B<Pod::Usage>
+
+=back
+
+=head1 TOOD
+
+=over 8
+
+=item Restore is limited to one specific database.
+
+=back
+
+=head1 AUTHOR
+
+Mikael Fridh
+
+=head1 ACKNOWLEDGEMENTS
+
+Domas Mituzas obviously.
+
+=cut
